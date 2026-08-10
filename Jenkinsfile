@@ -4,21 +4,21 @@ pipeline {
 
     stages {
 
-        stage('checkout') {
-             
+        stage('Checkout') {
             steps {
                 checkout scm
             }
+        }
 
-        stage('backend tests') {
+        stage('Backend Tests') {
             steps {
-                dir('backend'){
+                dir('backend') {
                     sh './mvnw test'
                 }
             }
         }
-        
-        stage('backend package') {
+
+        stage('Backend Package') {
             steps {
                 dir('backend') {
                     sh './mvnw package -DskipTests'
@@ -26,7 +26,7 @@ pipeline {
             }
         }
 
-        stage('frontend install') {
+        stage('Frontend Install') {
             steps {
                 dir('frontend') {
                     sh 'npm ci'
@@ -34,18 +34,17 @@ pipeline {
             }
         }
 
-        stage('frontend package') {
+        stage('Frontend Build') {
             steps {
                 dir('frontend') {
                     sh 'npm run build'
                 }
             }
         }
-
-        
     }
 
     post {
+
         success {
             echo 'CI pipeline completed successfully.'
         }
@@ -57,8 +56,5 @@ pipeline {
         always {
             echo 'CI pipeline execution completed.'
         }
-
-
-    }   
-
+    }
 }
