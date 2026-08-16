@@ -2,12 +2,18 @@ pipeline {
 
     agent any
 
+    options {
+        skipDefaultCheckout(true)
+        timestamps()
+    }
+
     environment {
-        AWS_REGION = 'us-west-2'
+        AWS_REGION     = 'us-west-2'
         AWS_ACCOUNT_ID = '938379788459'
 
-        ECR_FRONTEND = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/dev-frontend"
-        ECR_BACKEND  = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/dev-backend"
+        ECR_REGISTRY   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        FRONTEND_REPO  = 'dev-frontend'
+        BACKEND_REPO   = 'dev-backend'
     }
 
     stages {
@@ -18,7 +24,7 @@ pipeline {
             }
         }
 
-        stage('Prepare Jenkins Agent') {
+        stage('Verify Jenkins Environment') {
             steps {
                 sh '''
                     set -eux
@@ -27,37 +33,29 @@ pipeline {
                     aws --version
 
                     echo "Checking Docker..."
+                    docker --version
 
-                    if ! command -v docker >/dev/null 2>&1; then
-                        echo "Docker not found. Installing Docker..."
+                    echo "Checking Docker access..."
+                    docker info >/dev/null
 
-                        sudo dnf install -y docker
-                        sudo systemctl enable docker
-                        sudo systemctl start docker
-
-                        echo "Docker installation completed."
-                    else
-                        echo "Docker already installed."
-                    fi
-
-                    sudo systemctl start docker || true
-
-                    sudo docker --version
-                    sudo docker info >/dev/null
-
-                    echo "Jenkins agent preparation completed."
+                    echo "Jenkins AWS identity:"
+                    aws sts get-caller-identity
                 '''
             }
         }
 
-        stage('Verify AWS Identity') {
+        stage('Generate Image Tag') {
             steps {
-                sh '''
-                    set -eux
+                script {
+                    def commit = sh(
+                        script: 'git rev-parse --short=7 HEAD',
+                        returnStdout: true
+                    ).trim()
 
-                    echo "Verifying Jenkins AWS identity..."
-                    aws sts get-caller-identity
-                '''
+                    env.IMAGE_TAG = "${BUILD_NUMBER}-${commit}"
+
+                    echo "Docker image tag: ${env.IMAGE_TAG}"
+                }
             }
         }
 
@@ -105,29 +103,18 @@ pipeline {
             }
         }
 
-        stage('Generate Image Tag') {
-            steps {
-                script {
-                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT.take(7)}"
-                }
-
-                sh '''
-                    echo "Image tag: ${IMAGE_TAG}"
-                '''
-            }
-        }
-
         stage('ECR Login') {
             steps {
                 sh '''
                     set -eux
 
+                    echo "Logging into Amazon ECR..."
+
                     aws ecr get-login-password \
-                      --region "${AWS_REGION}" | \
-                    sudo docker login \
-                      --username AWS \
-                      --password-stdin \
-                      "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+                        --region "$AWS_REGION" | \
+                    docker login \
+                        --username AWS \
+                        --password-stdin "$ECR_REGISTRY"
                 '''
             }
         }
@@ -137,21 +124,19 @@ pipeline {
                 sh '''
                     set -eux
 
-                    echo "Building backend image..."
-                    sudo docker build \
-                      -t "${ECR_BACKEND}:${IMAGE_TAG}" \
-                      -t "${ECR_BACKEND}:latest" \
-                      ./backend
-
                     echo "Building frontend image..."
-                    sudo docker build \
-                      -t "${ECR_FRONTEND}:${IMAGE_TAG}" \
-                      -t "${ECR_FRONTEND}:latest" \
-                      ./frontend
+                    docker build \
+                        -t "$ECR_REGISTRY/$FRONTEND_REPO:$IMAGE_TAG" \
+                        ./frontend
 
-                    echo "Images built successfully."
+                    echo "Building backend image..."
+                    docker build \
+                        -t "$ECR_REGISTRY/$BACKEND_REPO:$IMAGE_TAG" \
+                        ./backend
 
-                    sudo docker images | grep -E 'dev-(frontend|backend)'
+                    echo "Docker images built successfully."
+
+                    docker images | grep "$IMAGE_TAG"
                 '''
             }
         }
@@ -161,17 +146,15 @@ pipeline {
                 sh '''
                     set -eux
 
-                    echo "Pushing backend image..."
-                    sudo docker push "${ECR_BACKEND}:${IMAGE_TAG}"
-
                     echo "Pushing frontend image..."
-                    sudo docker push "${ECR_FRONTEND}:${IMAGE_TAG}"
+                    docker push \
+                        "$ECR_REGISTRY/$FRONTEND_REPO:$IMAGE_TAG"
 
-                    echo "Pushing latest tags..."
-                    sudo docker push "${ECR_BACKEND}:latest"
-                    sudo docker push "${ECR_FRONTEND}:latest"
+                    echo "Pushing backend image..."
+                    docker push \
+                        "$ECR_REGISTRY/$BACKEND_REPO:$IMAGE_TAG"
 
-                    echo "Images pushed successfully."
+                    echo "Both images pushed successfully."
                 '''
             }
         }
@@ -181,17 +164,21 @@ pipeline {
                 sh '''
                     set -eux
 
-                    echo "Backend image:"
-                    aws ecr describe-images \
-                      --repository-name dev-backend \
-                      --region "${AWS_REGION}" \
-                      --image-ids imageTag="${IMAGE_TAG}"
+                    echo "Verifying frontend image in ECR..."
 
-                    echo "Frontend image:"
                     aws ecr describe-images \
-                      --repository-name dev-frontend \
-                      --region "${AWS_REGION}" \
-                      --image-ids imageTag="${IMAGE_TAG}"
+                        --repository-name "$FRONTEND_REPO" \
+                        --region "$AWS_REGION" \
+                        --image-ids imageTag="$IMAGE_TAG"
+
+                    echo "Verifying backend image in ECR..."
+
+                    aws ecr describe-images \
+                        --repository-name "$BACKEND_REPO" \
+                        --region "$AWS_REGION" \
+                        --image-ids imageTag="$IMAGE_TAG"
+
+                    echo "ECR image verification successful."
                 '''
             }
         }
@@ -200,12 +187,19 @@ pipeline {
     post {
 
         success {
-            echo "CI/CD image build and push completed successfully."
-            echo "Image tag: ${IMAGE_TAG}"
+            echo "============================================"
+            echo "CI/CD pipeline completed successfully."
+            echo "Image Tag: ${env.IMAGE_TAG}"
+            echo "Frontend: ${env.ECR_REGISTRY}/${env.FRONTEND_REPO}:${env.IMAGE_TAG}"
+            echo "Backend : ${env.ECR_REGISTRY}/${env.BACKEND_REPO}:${env.IMAGE_TAG}"
+            echo "============================================"
         }
 
         failure {
-            echo "Pipeline failed. Check the stage logs above."
+            echo "============================================"
+            echo "Pipeline failed."
+            echo "Check the failed stage and its logs."
+            echo "============================================"
         }
 
         always {
